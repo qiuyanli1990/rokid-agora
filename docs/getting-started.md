@@ -45,8 +45,8 @@ Use credentials and the pipeline from the same provider and project. Console lab
 ## 2. Download and prepare the example
 
 ```sh
-git clone https://github.com/yodaos-project/agora-aiui-sdk.git
-cd agora-aiui-sdk
+git clone <CUSTOMER_REPOSITORY_URL>
+cd <CUSTOMER_REPOSITORY_DIRECTORY>
 npm ci
 npm run example:prepare
 ```
