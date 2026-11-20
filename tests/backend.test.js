@@ -1,0 +1,566 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import { createHmac } from 'node:crypto';
+import { once } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import accessToken from 'agora-token/src/AccessToken2.js';
+import { createSessionService, participantUids } from '../examples/server/sessions.js';
+import { createVoiceHandler, bearerAuthorizer } from '../examples/server/http.js';
+import { createAgoraAgentFactory } from '../examples/server/agora.js';
+import { createWhipToken } from '../examples/server/token.js';
+import { createHttpVoiceBackend, createAgoraVoiceSession } from '../src/index.js';
+import { deferred, fakeRuntime, tick } from './helpers.js';
+import { transcriptSnapshot } from '../src/transcripts.js';
+
+const credentials = { appId: '1'.repeat(32), certificate: '2'.repeat(32) };
+const demoToken = 'test-business-api-token-not-a-real-secret';
+const defaults = { ...credentials, baseURL: 'https://whip.example.test' };
+
+test('managed participant accounts are distinct and respect the UTF-8 byte limit', () => {
+  for (const seed of ['example', 'a'.repeat(249)]) {
+    const { uid, botUid } = participantUids(seed);
+    assert.equal(uid, `aiui-${seed}`);
+    assert.equal(botUid, `agent-${seed}`);
+    assert.notEqual(uid, botUid);
+  }
+  for (const seed of [0, '', 'a'.repeat(250), '界'.repeat(84), NaN])
+    assert.throws(() => participantUids(seed), RangeError);
+});
+
+test('string-account WHIP JWT authorizes the channel without a numeric uid claim', () => {
+  const { token } = createWhipToken({ ...credentials, channel: 'example', uid: 'aiui-test' });
+  const claims = JSON.parse(Buffer.from(token.split('.')[1], 'base64url'));
+  assert.equal(claims.streamID, 'example');
+  assert.equal(claims.enableSubAuth, true);
+  assert.equal('uid' in claims, false);
+  assert.throws(() => createWhipToken({ ...credentials, channel: 'example', uid: '' }));
+});
+
+function service(options = {}) {
+  const events = [];
+  return {
+    events,
+    store: createSessionService({
+      ...defaults,
+      createAgent: () => ({
+        async start() {
+          events.push('start');
+        },
+        async stop() {
+          events.push('stop');
+        },
+      }),
+      ...options,
+    }),
+  };
+}
+
+async function listen(t, handler) {
+  const server = createServer(handler);
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(
+    () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(resolve);
+      }),
+  );
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('WHIP JWT uses certificate text, numeric UID and duplex claims with seconds exp', () => {
+  const result = createWhipToken({
+    ...credentials,
+    channel: 'example',
+    uid: 123,
+    now: 1_700_000_000_000,
+  });
+  const [header, payload, signature] = result.token.split('.');
+  assert.deepEqual(JSON.parse(Buffer.from(header, 'base64url')), { alg: 'HS256', typ: 'JWT' });
+  assert.deepEqual(JSON.parse(Buffer.from(payload, 'base64url')), {
+    version: '1.0',
+    appID: credentials.appId,
+    streamID: 'example',
+    uid: '123',
+    exp: 1_700_000_600,
+    action: 'pub',
+    enableSubAuth: true,
+  });
+  assert.equal(result.tokenExpiresAt, 1_700_000_600_000);
+  assert.equal(
+    signature,
+    createHmac('sha256', credentials.certificate)
+      .update(`${header}.${payload}`)
+      .digest('base64url'),
+  );
+  assert.throws(() => createWhipToken({ ...credentials, channel: 'a', uid: 0 }));
+});
+
+test('reservation creates string participants and starts once, stop is idempotent', async () => {
+  const { store, events } = service();
+  const reservation = store.createSession('alice');
+  assert.equal(events.length, 0);
+  assert.equal(typeof reservation.whip.uid, 'string');
+  assert.equal(reservation.whip.channel.length, 41);
+  await Promise.all([
+    store.startAgent(reservation.id, 'alice'),
+    store.startAgent(reservation.id, 'alice'),
+  ]);
+  assert.deepEqual(events, ['start']);
+  await Promise.all([
+    store.stopSession(reservation.id, 'alice'),
+    store.stopSession(reservation.id, 'alice'),
+  ]);
+  assert.deepEqual(events, ['start', 'stop']);
+  await assert.rejects(store.startAgent(reservation.id, 'alice'), { status: 410 });
+  assert.throws(() => store.refreshToken(reservation.id, 'bob'), { status: 404 });
+});
+
+test('stop during delayed cloud start waits and closes the eventual cloud agent', async () => {
+  const gate = deferred();
+  let stops = 0;
+  const { store } = service({
+    createAgent: () => ({
+      start: () => gate.promise,
+      async stop() {
+        stops++;
+      },
+    }),
+  });
+  const { id } = store.createSession('alice');
+  const starting = assert.rejects(store.startAgent(id, 'alice'), { status: 410 });
+  await tick();
+  const stopping = store.stopSession(id, 'alice');
+  assert.equal(stops, 0);
+  gate.resolve();
+  await Promise.all([starting, stopping]);
+  assert.equal(stops, 1);
+});
+
+test('lease renewal, abandoned reservations and absolute duration are enforced', async () => {
+  let clock = 0;
+  const { store, events } = service({ now: () => clock, leaseMs: 100, maxDurationMs: 250 });
+  const { id } = store.createSession('alice');
+  await store.startAgent(id, 'alice');
+  clock = 80;
+  assert.equal(store.renewSession(id, 'alice').lease.expiresAt, 180);
+  clock = 160;
+  assert.equal(store.renewSession(id, 'alice').lease.expiresAt, 250);
+  clock = 251;
+  await store.sweep();
+  assert.deepEqual(events, ['start', 'stop']);
+  assert.throws(() => store.renewSession(id, 'alice'), { status: 410 });
+  const abandoned = store.createSession('alice');
+  clock = 400;
+  await store.sweep();
+  await assert.rejects(store.startAgent(abandoned.id, 'alice'), { status: 410 });
+  await store.close();
+  assert.throws(() => store.createSession('alice'), { status: 503 });
+});
+
+test('failed cloud cleanup stays unconfirmed and is retried by the sweeper', async () => {
+  let stops = 0;
+  const { store } = service({
+    createAgent: () => ({
+      async start() {},
+      async stop() {
+        if (++stops === 1) throw new Error('upstream credentials');
+      },
+    }),
+  });
+  const { id } = store.createSession('alice');
+  await store.startAgent(id, 'alice');
+  await assert.rejects(store.stopSession(id, 'alice'), { code: 'AGENT_STOP_UNCONFIRMED' });
+  await store.sweep();
+  assert.equal(stops, 2);
+  assert.deepEqual(await store.stopSession(id, 'alice'), { stopped: true });
+});
+
+test('actual HTTP adapter and handler perform a managed SDK call without exposing secrets', async (t) => {
+  const runtime = fakeRuntime(t);
+  const { store, events } = service();
+  const baseURL = await listen(
+    t,
+    createVoiceHandler({ service: store, authorize: bearerAuthorizer(demoToken) }),
+  );
+  const backend = createHttpVoiceBackend({
+    baseURL,
+    authorization: async () => `Bearer ${demoToken}`,
+  });
+  const voice = createAgoraVoiceSession({ backend });
+  t.after(() => voice.stop());
+  await voice.start();
+  assert.deepEqual(events, ['start']);
+  const authorization = await runtime.whips[0].options.authorization();
+  const jwt = JSON.parse(Buffer.from(authorization.split('.')[1], 'base64url'));
+  const endpoint = new URL(runtime.whips[0].endpoint);
+  assert.equal('uid' in jwt, false);
+  assert.equal(endpoint.searchParams.has('Uid'), false);
+  assert.match(endpoint.searchParams.get('stringuid'), /^aiui-/);
+  assert.equal(jwt.streamID, decodeURIComponent(endpoint.pathname.slice('/pub/'.length)));
+  await voice.stop();
+  assert.deepEqual(events, ['start', 'stop']);
+  assert(!JSON.stringify(voice.getState()).includes(credentials.certificate));
+});
+
+test('business API requires authentication, checks CORS and rejects untyped payloads', async (t) => {
+  const { store } = service();
+  const baseURL = await listen(
+    t,
+    createVoiceHandler({
+      service: store,
+      authorize: bearerAuthorizer(demoToken),
+      allowedOrigins: ['https://agent.example.test'],
+    }),
+  );
+  const route = `${baseURL}/voice/sessions`;
+  assert.equal((await fetch(route, { method: 'POST' })).status, 401);
+  const headers = { Authorization: `Bearer ${demoToken}`, Origin: 'https://evil.example.test' };
+  assert.equal((await fetch(route, { method: 'POST', headers })).status, 403);
+  headers.Origin = 'https://agent.example.test';
+  const response = await fetch(route, { method: 'POST', headers });
+  assert.equal(response.status, 201);
+  assert.equal(response.headers.get('access-control-allow-origin'), headers.Origin);
+  assert(!JSON.stringify(await response.json()).includes(credentials.certificate));
+  assert.equal((await fetch(route, { method: 'POST', headers, body: '{}' })).status, 415);
+  assert.equal(
+    (await fetch(route, { method: 'OPTIONS', headers: { Origin: headers.Origin } })).status,
+    204,
+  );
+});
+
+test('HTTP responses are capped while reading chunks and cancelled on overflow', async () => {
+  let cancelled = false;
+  const backend = createHttpVoiceBackend({
+    baseURL: 'https://backend.example.test',
+    authorization: 'Bearer demo',
+    fetch: async () =>
+      new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.enqueue(new Uint8Array(40_000));
+          },
+          cancel() {
+            cancelled = true;
+          },
+        }),
+      ),
+  });
+  await assert.rejects(backend.createSession(), { code: 'BACKEND' });
+  assert(cancelled);
+});
+
+test('hanging authorization is bounded and backend errors are redacted', async () => {
+  const backend = createHttpVoiceBackend({
+    baseURL: 'https://backend.example.test',
+    authorization: () => new Promise(() => {}),
+    timeout: 10,
+  });
+  await assert.rejects(backend.createSession(), { code: 'BACKEND' });
+  const denied = createHttpVoiceBackend({
+    baseURL: 'https://backend.example.test',
+    authorization: 'Bearer demo',
+    fetch: async () => new Response('provider-secret', { status: 500 }),
+  });
+  await assert.rejects(
+    denied.createSession(),
+    (error) => !error.message.includes('provider-secret'),
+  );
+});
+
+test('HTTP success without an explicit agent acknowledgement is not treated as cloud success', async () => {
+  const backend = createHttpVoiceBackend({
+    baseURL: 'https://backend.example.test',
+    authorization: 'Bearer demo',
+    fetch: async () => Response.json({}),
+  });
+  await assert.rejects(backend.startAgent({ sessionId: 'test' }), { code: 'BACKEND' });
+  await assert.rejects(backend.stopSession({ sessionId: 'test' }), { code: 'BACKEND' });
+});
+
+test('official Agora server SDK preserves string accounts in join, auth and RTC tokens', async (t) => {
+  const requests = [];
+  let stopAttempts = 0;
+  const upstream = await listen(t, async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push({
+      method: request.method,
+      path: request.url,
+      authorization: request.headers.authorization,
+      body: body ? JSON.parse(body) : null,
+    });
+    response.setHeader('Content-Type', 'application/json');
+    if (request.url.endsWith('/leave') && ++stopAttempts === 1) {
+      response.writeHead(500);
+      response.end(JSON.stringify({ message: 'Retry this stop.' }));
+      return;
+    }
+    response.end(
+      JSON.stringify(
+        request.method === 'POST' && request.url.endsWith('/join')
+          ? { agent_id: 'test-cloud-agent' }
+          : request.url.endsWith('/history')
+            ? {
+                contents: [
+                  { role: 'user', turn_id: 1, content: 'Hi.', metadata: { private: 'hidden' } },
+                  { role: 'assistant', turn_id: 1, content: 'Hello.' },
+                ],
+              }
+            : {},
+      ),
+    );
+  });
+  const previous = process.env.AGORA_AGENTS_API_BASE_URL;
+  process.env.AGORA_AGENTS_API_BASE_URL = upstream;
+  t.after(() => {
+    if (previous === undefined) delete process.env.AGORA_AGENTS_API_BASE_URL;
+    else process.env.AGORA_AGENTS_API_BASE_URL = previous;
+  });
+  const factory = createAgoraAgentFactory({
+    ...credentials,
+    pipelineId: 'test-pipeline',
+    area: 'AP',
+    enableRtm: true,
+    enableInterruption: true,
+    asrLanguage: 'zh-CN',
+  });
+  const bot = factory({
+    sessionId: 'test',
+    channel: 'test-channel',
+    uid: 'aiui-test',
+    botUid: 'agent-test',
+    maxDurationSeconds: 600,
+  });
+  await bot.start();
+  const text = await bot.getTranscripts();
+  assert.deepEqual(
+    text.map((entry) => entry.text),
+    ['Hi.', 'Hello.'],
+  );
+  assert(!JSON.stringify(text).includes('hidden'));
+  await assert.rejects(bot.stop(), { statusCode: 500 });
+  await bot.stop();
+  assert.equal(requests.length, 4);
+  assert.match(requests[0].path, /\/projects\/[\da-f]+\/join$/);
+  assert.match(requests[0].authorization, /^agora token=/);
+  const payload = requests[0].body;
+  assert.equal(payload.pipeline_id, 'test-pipeline');
+  assert.equal(payload.properties.channel, 'test-channel');
+  assert.equal(payload.properties.agent_rtc_uid, 'agent-test');
+  assert.deepEqual(payload.properties.remote_rtc_uids, ['aiui-test']);
+  assert.equal(payload.properties.enable_string_uid, true);
+  assert.deepEqual(payload.properties.interruption, { enable: true });
+  assert.equal(payload.properties.advanced_features.enable_rtm, true);
+  assert.equal(payload.properties.parameters.data_channel, 'rtm');
+  assert.deepEqual(payload.properties.asr, { language: 'zh-CN' });
+  for (const encoded of [
+    payload.properties.token,
+    requests[0].authorization.slice('agora token='.length),
+    ...requests.slice(1).map((request) => request.authorization.slice('agora token='.length)),
+  ]) {
+    const parsed = new accessToken.AccessToken2();
+    assert.equal(parsed.from_string(encoded), true);
+    assert.equal(parsed.appId.toString(), credentials.appId);
+    assert.equal(parsed.getServices(1)[0].__channel_name.toString(), 'test-channel');
+    assert.equal(parsed.getServices(1)[0].__uid.toString(), 'agent-test');
+    assert.equal(parsed.getServices(2)[0].__user_id.toString(), 'agent-test');
+    assert.equal(parsed.getServices(9).length, 1);
+  }
+  assert.match(requests[1].path, /\/agents\/test-cloud-agent\/history$/);
+  assert.equal(requests[1].method, 'GET');
+  assert.match(requests[2].path, /\/agents\/test-cloud-agent\/leave$/);
+  assert.equal(requests[3].path, requests[2].path);
+});
+
+test('China service uses the CN API path and a ConvoAI token with string accounts', async (t) => {
+  const requests = [];
+  const origin = await listen(t, async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push({
+      path: request.url,
+      authorization: request.headers.authorization,
+      body: body ? JSON.parse(body) : null,
+    });
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify(request.url.endsWith('/join') ? { agent_id: 'cn-agent' } : {}));
+  });
+  const previous = process.env.AGORA_AGENTS_API_BASE_URL;
+  process.env.AGORA_AGENTS_API_BASE_URL = origin;
+  t.after(() => {
+    if (previous === undefined) delete process.env.AGORA_AGENTS_API_BASE_URL;
+    else process.env.AGORA_AGENTS_API_BASE_URL = previous;
+  });
+  const factory = createAgoraAgentFactory({
+    ...credentials,
+    pipelineId: 'cn-pipeline',
+    area: 'CN',
+    enableRtm: true,
+  });
+  const bot = factory({
+    sessionId: 'cn-test',
+    channel: 'cn-channel',
+    uid: 'aiui-client',
+    botUid: 'aiui-agent',
+    maxDurationSeconds: 600,
+  });
+  await bot.start();
+  await bot.stop();
+  assert.equal(requests.length, 2);
+  assert.equal(
+    requests[0].path,
+    `/cn/api/conversational-ai-agent/v2/projects/${credentials.appId}/join`,
+  );
+  assert.match(
+    requests[1].path,
+    /\/cn\/api\/conversational-ai-agent\/v2\/projects\/.*\/agents\/cn-agent\/leave$/,
+  );
+  assert.equal(requests[0].body.pipeline_id, 'cn-pipeline');
+  assert.equal(requests[0].body.properties.enable_string_uid, true);
+  assert.equal(requests[0].body.properties.agent_rtc_uid, 'aiui-agent');
+  assert.deepEqual(requests[0].body.properties.remote_rtc_uids, ['aiui-client']);
+  for (const encoded of [
+    requests[0].body.properties.token,
+    ...requests.map((request) => request.authorization.slice('agora token='.length)),
+  ]) {
+    const parsed = new accessToken.AccessToken2();
+    assert.equal(parsed.from_string(encoded), true);
+    assert.equal(parsed.getServices(9).length, 1);
+    assert.equal(parsed.getServices(1)[0].__channel_name.toString(), 'cn-channel');
+    assert.equal(parsed.getServices(1)[0].__uid.toString(), 'aiui-agent');
+    assert.equal(parsed.getServices(2)[0].__user_id.toString(), 'aiui-agent');
+  }
+});
+
+test('the China reference server requires an explicitly enabled WHIP origin', () => {
+  const result = spawnSync(process.execPath, ['examples/server/main.js'], {
+    cwd: new URL('../', import.meta.url),
+    env: { ...process.env, AGORA_AREA: 'CN', AGORA_WHIP_BASE_URL: '' },
+    encoding: 'utf8',
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Set AGORA_WHIP_BASE_URL/);
+});
+
+test('managed voice calls route through the China backend with matching identities', async (t) => {
+  const requests = [];
+  const upstream = await listen(t, async (request, response) => {
+    let body = '';
+    for await (const chunk of request) body += chunk;
+    requests.push({ path: request.url, body: body ? JSON.parse(body) : null });
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify(request.url.endsWith('/join') ? { agent_id: 'cn-agent' } : {}));
+  });
+  const previous = process.env.AGORA_AGENTS_API_BASE_URL;
+  process.env.AGORA_AGENTS_API_BASE_URL = upstream;
+  t.after(() => {
+    if (previous === undefined) delete process.env.AGORA_AGENTS_API_BASE_URL;
+    else process.env.AGORA_AGENTS_API_BASE_URL = previous;
+  });
+  const createAgent = createAgoraAgentFactory({
+    ...credentials,
+    area: 'CN',
+    pipelineId: 'cn-pipeline',
+    enableRtm: true,
+  });
+  const store = createSessionService({ ...defaults, createAgent });
+  t.after(() => store.close());
+  const baseURL = await listen(
+    t,
+    createVoiceHandler({ service: store, authorize: bearerAuthorizer(demoToken) }),
+  );
+  const runtime = fakeRuntime(t);
+  const backend = createHttpVoiceBackend({ baseURL, authorization: `Bearer ${demoToken}` });
+  const voice = createAgoraVoiceSession({ backend });
+  t.after(() => voice.stop());
+  await voice.start();
+  const endpoint = new URL(runtime.whips[0].endpoint);
+  const payload = requests[0].body;
+  assert.match(requests[0].path, /^\/cn\/api\/conversational-ai-agent\/v2\/projects\/.*\/join$/);
+  assert.equal(payload.pipeline_id, 'cn-pipeline');
+  assert.equal(
+    payload.properties.channel,
+    decodeURIComponent(endpoint.pathname.slice('/pub/'.length)),
+  );
+  assert.deepEqual(payload.properties.remote_rtc_uids, [endpoint.searchParams.get('stringuid')]);
+  assert.notEqual(payload.properties.agent_rtc_uid, endpoint.searchParams.get('stringuid'));
+  assert.equal(payload.properties.enable_string_uid, true);
+  await voice.stop();
+  assert.match(requests[1].path, /\/agents\/cn-agent\/leave$/);
+});
+
+test('RTM credentials match the reservation and refresh only for its owner while active', async (t) => {
+  const { store } = service();
+  t.after(() => store.close());
+  let refreshes = 0;
+  const handler = createVoiceHandler({ service: store, authorize: bearerAuthorizer(demoToken) });
+  const baseURL = await listen(t, (request, response) => {
+    if (request.url.endsWith('/rtm-token')) refreshes++;
+    return handler(request, response);
+  });
+  const backend = createHttpVoiceBackend({ baseURL, authorization: `Bearer ${demoToken}` });
+  const reservation = await backend.createSession({ signal: new AbortController().signal });
+  assert.equal(reservation.rtm.channel, reservation.whip.channel);
+  assert.equal(reservation.rtm.userId, reservation.whip.uid);
+  assert.notEqual(reservation.rtm.agentUserId, reservation.rtm.userId);
+  for (let call = 0; call < 2; call++) {
+    const encoded = await reservation.rtm.token({ signal: new AbortController().signal });
+    const parsed = new accessToken.AccessToken2();
+    assert.equal(parsed.from_string(encoded), true);
+    assert.equal(parsed.getServices(2)[0].__user_id.toString(), reservation.whip.uid);
+    assert.equal(refreshes, call);
+  }
+  assert.throws(() => store.refreshRtmToken(reservation.id, 'another-owner'), { status: 404 });
+  await backend.stopSession({ sessionId: reservation.id, signal: new AbortController().signal });
+  await assert.rejects(reservation.rtm.token({ signal: new AbortController().signal }), {
+    code: 'BACKEND',
+  });
+});
+
+test('transcript HTTP reads enforce ownership, coalesce requests and redact closed reservations', async (t) => {
+  const runtime = fakeRuntime(t);
+  let reads = 0;
+  let release;
+  const { store } = service({
+    createAgent: () => ({
+      async start() {},
+      async stop() {},
+      async getTranscripts() {
+        reads++;
+        if (release) await release.promise;
+        return transcriptSnapshot([{ id: 'assistant:1', role: 'assistant', text: 'Hello.' }]);
+      },
+    }),
+  });
+  t.after(() => store.close());
+  const baseURL = await listen(
+    t,
+    createVoiceHandler({ service: store, authorize: bearerAuthorizer(demoToken) }),
+  );
+  const backend = createHttpVoiceBackend({ baseURL, authorization: `Bearer ${demoToken}` });
+  const voice = createAgoraVoiceSession({ backend });
+  t.after(() => voice.stop());
+  await voice.start();
+  const text = await voice.getTranscripts();
+  assert.equal(text[0].text, 'Hello.');
+  const other = store.createSession('alice');
+  await store.startAgent(other.id, 'alice');
+  await assert.rejects(store.getTranscripts(other.id, 'someone-else'), { status: 404 });
+  release = deferred();
+  const first = store.getTranscripts(other.id, 'alice');
+  const second = store.getTranscripts(other.id, 'alice');
+  const rejected = Promise.all([
+    assert.rejects(first, { status: 410 }),
+    assert.rejects(second, { status: 410 }),
+  ]);
+  await tick();
+  assert.equal(reads, 2, 'parallel readers share one upstream history request');
+  await store.stopSession(other.id, 'alice');
+  release.resolve();
+  await rejected;
+  await voice.stop();
+  await assert.rejects(voice.getTranscripts(), { code: 'ABORTED' });
+});
