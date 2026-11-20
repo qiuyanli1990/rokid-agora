@@ -59,8 +59,6 @@ Generate a token with:
 node -e "console.log(require('node:crypto').randomBytes(24).toString('hex'))"
 ```
 
-For Shengwang China, set `AGORA_AREA=CN`, use the Shengwang API origin and the WHIP endpoint enabled for the project. Keep the App ID, certificate, and pipeline from the same project.
-
 Start the backend and leave this terminal open:
 
 ```sh
@@ -85,7 +83,7 @@ export default {
 };
 ```
 
-Replace the IP address and token. Use `provider: 'shengwang'` for a Shengwang pipeline. `backendURL` may use private HTTP only for LAN development; use HTTPS for a deployed backend.
+Replace the IP address and token.  `backendURL` may use private HTTP only for LAN development; use HTTPS for a deployed backend.
 
 ## 5. Test locally before uploading
 
@@ -99,14 +97,11 @@ Allow microphone access, tap **Let's talk**, ask a question, confirm that the ag
 
 ## 6. Import the Agent into AIUI Studio
 
-1. Push this repository to the customer's GitHub account.
-2. Open AIUI Studio: <https://aiui-global.rokid.com/> (global) or <https://aiui.rokid.com/space> (China).
-3. Choose **GitHub import** and authorize GitHub if requested.
-4. Select the customer repository, branch/tag, and directory **`examples/agent`**. Do not import the repository root; the backend is not an AIUI Agent.
-5. Open the imported project in the **Code** tab and verify `configuration.js` contains the reachable LAN URL and the matching backend token.
-6. Use **Preview** to check the page. Preview only proves the UI can load; the backend computer must be reachable from the preview runtime.
+1. Open AIUI Studio: <https://aiui-global.rokid.com/> 
+2. upload examples/agent from  **Local import** 
+3. Open the imported project in the **Code** tab and verify `configuration.js` contains the reachable LAN URL and the matching backend token.
+4. Use **Preview** to check the page. Preview only proves the UI can load; the backend computer must be reachable from the preview runtime.
 
-If GitHub import is unavailable, download the repository and use **Local import** with the `examples/agent` folder.
 
 ## 7. Package and update the glasses
 
