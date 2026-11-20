@@ -22,8 +22,8 @@ The App Certificate and any model/vendor keys stay in the backend `.env` file. N
 ## 2. Get the code and install dependencies
 
 ```sh
-git clone <CUSTOMER_REPOSITORY_URL>
-cd <CUSTOMER_REPOSITORY_DIRECTORY>
+git clone https://github.com/qiuyanli1990/rokid-agora
+cd rokid-agora
 npm ci
 npm run example:prepare
 ```
